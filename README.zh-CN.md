@@ -2,6 +2,10 @@
 
 [English](README.md)
 
+> 我并不想屏蔽任何玩家，但无奈有时会反复匹配到同一个玩家，又被对方反复取消；屏蔽可以节省我们双方的时间。
+>
+> Wi-Fi 玩家应该买一根网线。
+
 为 **UNDER NIGHT IN-BIRTH II Sys:Celes** 的 Steam 匹配加入玩家屏蔽功能的 Windows 工具。
 
 [**下载 Windows 运行包**](https://github.com/geturin/uni2-block-list/releases/download/v0.1.0-rc.1/UNI2-Block-List-0.1.0-rc.1-win32.zip) · [全部版本](https://github.com/geturin/uni2-block-list/releases)
