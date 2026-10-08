@@ -1,0 +1,213 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-i686 g++-mingw-w64-i686 binutils-mingw-w64-i686
+      - id: version
+        run: python -c 'import build; print("version=" + build.VERSION)' >> "$GITHUB_OUTPUT"
+      - run: python build.py --package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-package
+          path: |
+            build/*.zip
+            build/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: windows-package
+          path: package
+      - name: Verify archive and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-Item package/*.zip
+          $expected = ((Get-Content package/SHA256SUMS.txt -Raw).Trim() -split '\s+')[0]
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'ZIP checksum mismatch' }
+          Expand-Archive $zip -DestinationPath unpacked
+          $app = (Get-Item unpacked/*).FullName
+          $receipt = Get-Content "$app/SHA256.json" -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+          if ($receipt.Count -ne 6 -or (Get-ChildItem $app -File).Count -ne 7) { throw 'Unexpected package contents' }
+          foreach ($name in $receipt.Keys) {
+            if ((Get-FileHash (Join-Path $app $name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $receipt[$name]) { throw "Checksum mismatch: $name" }
+          }
+          "APP=$app" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Native Windows GUI smoke check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type @'
+          using System;
+          using System.Text;
+          using System.Runtime.InteropServices;
+          public static class Ui {
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string title);
+            [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr h, int id);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int count);
+            [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+            [DllImport("user32.dll", EntryPoint="GetClassLongPtrW")] static extern IntPtr GetClassLongPtr(IntPtr h, int index);
+            [DllImport("kernel32.dll")] public static extern ushort GetUserDefaultUILanguage();
+            [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out Rect r);
+            [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+            [StructLayout(LayoutKind.Sequential)] public struct Rect { public int left, top, right, bottom; }
+            public static IntPtr Main() { return FindWindow("UNI2BlockListWindow", null); }
+            public static IntPtr Activity() { return FindWindow("UNI2BlockListActivityWindow", null); }
+            public static string Text(IntPtr h) { var s=new StringBuilder(256); GetWindowText(h,s,s.Capacity); return s.ToString(); }
+            public static void Command(IntPtr h, int id) { SendMessage(h,0x111,new IntPtr(id),IntPtr.Zero); }
+            public static void Language(IntPtr h, int index) { SendMessage(GetDlgItem(h,114),0x14e,new IntPtr(index),IntPtr.Zero); Command(h,114 | (1<<16)); }
+            public static bool HasIcon(IntPtr h) { return SendMessage(h,0x7f,new IntPtr(1),IntPtr.Zero)!=IntPtr.Zero || GetClassLongPtr(h,-14)!=IntPtr.Zero || GetClassLongPtr(h,-34)!=IntPtr.Zero; }
+
+          }
+          '@
+          Add-Type -AssemblyName System.Drawing
+          function Require($condition, $description) { if (!$condition) { throw $description }; Write-Host "PASS: $description" }
+          function Start-App {
+            $script:process = Start-Process "$env:APP/UNI2 Block List.exe" -PassThru
+            for ($i=0; $i -lt 100; $i++) {
+              $h = [Ui]::Main(); [uint32]$owner = 0
+              if ($h -ne [IntPtr]::Zero) { [Ui]::GetWindowThreadProcessId($h,[ref]$owner) | Out-Null }
+              if (!$script:process.HasExited -and $owner -eq $script:process.Id -and [Ui]::GetDlgItem($h,114) -ne [IntPtr]::Zero -and [Ui]::GetDlgItem($h,113) -ne [IntPtr]::Zero -and [Ui]::GetDlgItem($h,109) -ne [IntPtr]::Zero -and [Ui]::GetDlgItem($h,115) -ne [IntPtr]::Zero) { return $h }
+              if ($script:process.HasExited) { throw 'GUI exited during startup' }; Start-Sleep -Milliseconds 100
+            }
+            throw 'GUI startup timed out'
+          }
+          function Stop-App {
+            [Ui]::SendMessage([Ui]::Main(),0x10,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
+            if (!$script:process.WaitForExit(5000)) { $script:process.Kill(); throw 'GUI did not close' }
+            Require ($script:process.ExitCode -eq 0) 'clean GUI exit'
+          }
+          function Capture($window, $name) {
+            Start-Sleep -Milliseconds 300
+            $r = [Ui+Rect]::new()
+            if (![Ui]::GetWindowRect($window,[ref]$r)) { throw 'Window rectangle unavailable' }
+            $bmp = [Drawing.Bitmap]::new($r.right-$r.left,$r.bottom-$r.top)
+            $g = [Drawing.Graphics]::FromImage($bmp)
+            try {
+              $dc = $g.GetHdc()
+              try { $ok = [Ui]::PrintWindow($window,$dc,2) } finally { $g.ReleaseHdc($dc) }
+              if (!$ok) { throw 'Native window capture failed' }
+              $colors = [Collections.Generic.HashSet[int]]::new()
+              for ($y=0; $y -lt $bmp.Height; $y+=8) { for ($x=0; $x -lt $bmp.Width; $x+=8) { [void]$colors.Add($bmp.GetPixel($x,$y).ToArgb()) } }
+              if ($colors.Count -lt 6) { throw 'Native window capture is blank' }
+              $bmp.Save((Join-Path $PWD "screenshots/$name.png"),[Drawing.Imaging.ImageFormat]::Png)
+            } finally { $g.Dispose(); $bmp.Dispose() }
+          }
+          $prefs = Join-Path $env:LOCALAPPDATA UNI2BlockList
+          if (Test-Path $prefs) { throw 'A fresh runner configuration is required' }
+          New-Item screenshots -ItemType Directory | Out-Null
+          try {
+            $h = Start-App
+            $initial = if (([Ui]::GetUserDefaultUILanguage() -band 0x3ff) -eq 4) { 'UNI2 黑名单' } else { 'UNI2 Block List' }
+            Require ([Ui]::Text($h) -eq $initial) 'first launch follows the Windows UI language'
+            Require (![Ui]::HasIcon($h)) 'no application icon'
+            [Ui]::Language($h,1)
+            Require ([Ui]::Text($h) -eq 'UNI2 Block List') 'English title'
+            Require ([Ui]::Text([Ui]::GetDlgItem($h,113)) -eq 'Block Wi-Fi players') 'English Wi-Fi label'
+            Capture $h english
+            [Ui]::SendMessage([Ui]::GetDlgItem($h,113),0xf5,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
+            Require ([Ui]::SendMessage([Ui]::GetDlgItem($h,113),0xf0,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32() -eq 1) 'Wi-Fi checkbox toggles'
+            Require ((Get-Content "$prefs/options.ini" -Raw).Trim() -eq 'block_wifi_players=1') 'Wi-Fi option saved'
+            [Ui]::SendMessage([Ui]::GetDlgItem($h,115),0xf5,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
+            Require ([Ui]::Activity() -ne [IntPtr]::Zero) 'request activity window opens'
+            [Ui]::SendMessage([Ui]::GetDlgItem([Ui]::Activity(),116),0xf5,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
+            [Ui]::SendMessage([Ui]::Activity(),0x10,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
+            Require ([Ui]::Main() -ne [IntPtr]::Zero) 'closing activity preserves main window'
+            [Ui]::Language($h,0)
+            Require ([Ui]::Text($h) -eq 'UNI2 黑名单') 'Chinese title'
+            Require ([Ui]::Text([Ui]::GetDlgItem($h,113)) -eq '屏蔽 Wi-Fi 玩家') 'Chinese Wi-Fi label'
+            Capture $h chinese
+            Stop-App
+            $h = Start-App
+            Require ([Ui]::Text($h) -eq 'UNI2 黑名单') 'explicit language survives restart'
+            Require ([Ui]::SendMessage([Ui]::GetDlgItem($h,113),0xf0,[IntPtr]::Zero,[IntPtr]::Zero).ToInt32() -eq 1) 'Wi-Fi option survives restart'
+            [Ui]::Language($h,1)
+            Stop-App
+          } finally {
+            if ($process -and !$process.HasExited) { $process.Kill(); $process.WaitForExit() }
+          }
+      - name: Native 32-bit DLL smoke check
+        shell: pwsh
+        run: |
+          $source = @'
+          $ErrorActionPreference = 'Stop'
+          if ([IntPtr]::Size -ne 4) { throw 'DLL check must run in a 32-bit process' }
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Dll {
+            [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] public static extern IntPtr LoadLibrary(string name);
+            [DllImport("kernel32.dll",CharSet=CharSet.Ansi)] public static extern IntPtr GetProcAddress(IntPtr h,string name);
+            [DllImport("kernel32.dll")] public static extern bool FreeLibrary(IntPtr h);
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate uint Start(IntPtr request);
+          }
+          "@
+          $module = [Dll]::LoadLibrary("$env:APP/uni2-block-list.dll")
+          if ($module -eq [IntPtr]::Zero) { throw 'DLL load failed' }
+          $request = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
+          try {
+            $address = [Dll]::GetProcAddress($module,'BlockListStart')
+            if ($address -eq [IntPtr]::Zero) { throw 'BlockListStart export missing' }
+            $call = [Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($address,[type][Dll+Start])
+            if ($call.Invoke([IntPtr]::Zero) -ne 1) { throw 'Null request was not rejected' }
+            [Runtime.InteropServices.Marshal]::WriteInt32($request,0,16)
+            [Runtime.InteropServices.Marshal]::WriteInt32($request,4,2)
+            [Runtime.InteropServices.Marshal]::WriteInt32($request,8,99)
+            [Runtime.InteropServices.Marshal]::WriteInt32($request,12,0)
+            if ($call.Invoke($request) -ne 1) { throw 'Unsupported ABI was not rejected' }
+            [Runtime.InteropServices.Marshal]::WriteInt32($request,4,3)
+            if ($call.Invoke($request) -ne 2 -or [Runtime.InteropServices.Marshal]::ReadInt32($request,8) -ne 2) { throw 'Non-game process was not rejected' }
+            Write-Host 'PASS: native PE32 DLL load, export, invalid request and non-game guards'
+          } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($request); [Dll]::FreeLibrary($module) | Out-Null }
+          '@
+          [IO.File]::WriteAllText("$PWD/dll-check.ps1",$source,[Text.UTF8Encoding]::new($true))
+          & "$env:WINDIR/SysWOW64/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$PWD/dll-check.ps1"
+          if ($LASTEXITCODE -ne 0) { throw "DLL smoke check failed: $LASTEXITCODE" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-ui-preview
+          path: screenshots/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    needs: [build, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: windows-package
+          path: package
+      - name: Publish verified candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          gh release create "v$VERSION" package/*.zip package/SHA256SUMS.txt \
+            --target "$COMMIT" --prerelease --title "UNI2 Block List $VERSION" \
+            --notes 'Portable Windows build. Extract the whole ZIP, start the game, then run UNI2 Block List.exe. Restart the game before upgrading. English and Chinese UI, player block list, Wi-Fi player blocking and request activity. Native Windows startup, language persistence and DLL guard checks passed; live matchmaking remains dependent on the supported game version. SHA-256 checksums are included.'
