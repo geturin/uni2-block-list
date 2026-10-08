@@ -2,6 +2,10 @@
 
 [中文说明](README.zh-CN.md)
 
+> I don't want to block anyone, but when I keep getting matched with the same player only to be declined over and over, blocking them saves us both time.
+>
+> Wi-Fi players should buy an Ethernet cable.
+
 A Windows tool for blocking unwanted players in **UNDER NIGHT IN-BIRTH II Sys:Celes** Steam matchmaking.
 
 [**Download for Windows**](https://github.com/geturin/uni2-block-list/releases/download/v0.1.0-rc.1/UNI2-Block-List-0.1.0-rc.1-win32.zip) · [All releases](https://github.com/geturin/uni2-block-list/releases)
